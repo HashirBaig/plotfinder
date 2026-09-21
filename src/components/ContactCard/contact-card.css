@@ -1,0 +1,35 @@
+@keyframes contact-card {
+  0% {
+    opacity: 0.5;
+    transform: translate(120%, 120%) scale(0.85);
+  }
+
+  10% {
+    opacity: 1;
+    transform: translate(-8px, -8px) scale(1.02);
+  }
+
+  14% {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+
+  75% {
+    opacity: 1;
+    transform: translate(0, 0) scale(1);
+  }
+
+  90% {
+    opacity: 1;
+    transform: translate(10px, 10px) scale(0.98);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(120%, 120%) scale(0.85);
+  }
+}
+
+.animate-contact-card {
+  animation: contact-card 7s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
