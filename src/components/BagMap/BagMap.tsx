@@ -164,12 +164,6 @@ const BAG_TILE_URL =
 const LOCATION_SEARCH_URL =
   "https://api.pdok.nl/kadaster/location-api/v1/search";
 
-const BAG_ADRES_URL =
-  "https://api.pdok.nl/kadaster/bag/ogc/v2/collections/adres/items";
-
-const BAG_VERBLIJFSOBJECT_URL =
-  "https://api.pdok.nl/kadaster/bag/ogc/v2/collections/verblijfsobject/items";
-
 const BAG_PAND_URL =
   "https://api.pdok.nl/kadaster/bag/ogc/v2/collections/pand/items";
 
@@ -187,40 +181,6 @@ interface BagProps {
   gebruiksdoel?: string;
 
   aantal_verblijfsobjecten?: number;
-}
-
-interface BagAddressProps {
-  identificatie?: string;
-
-  adresseerbaar_object_identificatie?: string;
-
-  adresseerbaar_object_type?: string;
-}
-
-interface BagAddressFeature {
-  type: "Feature";
-
-  id: string;
-
-  properties: BagAddressProps;
-
-  geometry?: Geometry;
-}
-
-interface VerblijfsobjectProps {
-  identificatie?: string;
-
-  pand?: unknown;
-}
-
-interface VerblijfsobjectFeature {
-  type: "Feature";
-
-  id?: string;
-
-  properties: VerblijfsobjectProps;
-
-  geometry?: Geometry;
 }
 
 interface PandFeature {
@@ -341,64 +301,6 @@ const layerStyles = new Proxy(
 );
 
 // -----------------------------------------------------------------------------
-// Helper: extract Pand ID from BAG relation
-// -----------------------------------------------------------------------------
-
-const extractPandId = (relation: unknown): string | undefined => {
-  if (!relation) {
-    return undefined;
-  }
-
-  // Example:
-  // ["0153100000123456"]
-
-  if (Array.isArray(relation)) {
-    for (const item of relation) {
-      const id = extractPandId(item);
-
-      if (id) {
-        return id;
-      }
-    }
-
-    return undefined;
-  }
-
-  if (typeof relation === "string") {
-    // Plain BAG ID
-    if (/^\d{16}$/.test(relation)) {
-      return relation;
-    }
-
-    // Possibly URL ending in BAG ID
-    const match = relation.match(/(\d{16})(?:\/)?$/);
-
-    return match?.[1];
-  }
-
-  if (typeof relation === "object") {
-    const object = relation as Record<string, unknown>;
-
-    const candidates = [
-      object.identificatie,
-      object.id,
-      object.value,
-      object.href,
-    ];
-
-    for (const candidate of candidates) {
-      const id = extractPandId(candidate);
-
-      if (id) {
-        return id;
-      }
-    }
-  }
-
-  return undefined;
-};
-
-// -----------------------------------------------------------------------------
 // Search component
 // -----------------------------------------------------------------------------
 
@@ -503,149 +405,129 @@ const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
     };
   }, [query]);
 
-  // ---------------------------------------------------------------------------
-  // Get BAG Address
-  // ---------------------------------------------------------------------------
+  const pointInsideRing = (lng: number, lat: number, ring: number[][]) => {
+    let inside = false;
 
-  const getBagAddress = async (feature: LocationSearchFeature) => {
-    if (!feature.id) {
-      throw new Error("Location API result has no feature ID.");
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [xi, yi] = ring[i];
+      const [xj, yj] = ring[j];
+
+      const intersects =
+        yi > lat !== yj > lat &&
+        lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi;
+
+      if (intersects) {
+        inside = !inside;
+      }
     }
 
-    const response = await fetch(
-      `${BAG_ADRES_URL}/${encodeURIComponent(feature.id)}?f=json`,
-    );
-
-    if (!response.ok) {
-      throw new Error(`BAG address request failed with ${response.status}`);
-    }
-
-    return (await response.json()) as BagAddressFeature;
+    return inside;
   };
 
-  // ---------------------------------------------------------------------------
-  // Get Verblijfsobject
-  // ---------------------------------------------------------------------------
+  const pointInsidePolygon = (
+    lng: number,
+    lat: number,
+    geometry: GeoPolygon | MultiPolygon,
+  ) => {
+    const polygons =
+      geometry.type === "Polygon"
+        ? [geometry.coordinates]
+        : geometry.coordinates;
 
-  const getVerblijfsobject = async (identificatie: string) => {
-    const params = new URLSearchParams({
-      f: "json",
+    for (const polygon of polygons) {
+      const outerRing = polygon[0];
 
-      identificatie,
+      if (!pointInsideRing(lng, lat, outerRing)) {
+        continue;
+      }
 
-      limit: "1",
-    });
+      // Make sure point isn't inside a hole
+      let insideHole = false;
 
-    const response = await fetch(
-      `${BAG_VERBLIJFSOBJECT_URL}?${params.toString()}`,
-    );
+      for (let i = 1; i < polygon.length; i++) {
+        if (pointInsideRing(lng, lat, polygon[i])) {
+          insideHole = true;
+          break;
+        }
+      }
 
-    if (!response.ok) {
-      throw new Error(`Verblijfsobject request failed with ${response.status}`);
+      if (!insideHole) {
+        return true;
+      }
     }
 
-    const data =
-      (await response.json()) as FeatureCollectionResponse<VerblijfsobjectFeature>;
-
-    return data.features?.[0];
+    return false;
   };
 
-  // ---------------------------------------------------------------------------
-  // Get Pand
-  // ---------------------------------------------------------------------------
+  const findPandAtLocation = async (lng: number, lat: number) => {
+    /*
+     * Roughly a small area around the selected address.
+     *
+     * ~0.00015 degrees is around 10–20 metres at this latitude.
+     */
+    const delta = 0.0002;
 
-  const getPand = async (pandId: string) => {
+    const bbox = [lng - delta, lat - delta, lng + delta, lat + delta].join(",");
+
     const params = new URLSearchParams({
       f: "json",
-
-      identificatie: pandId,
-
-      limit: "1",
+      bbox,
+      limit: "50",
     });
 
     const response = await fetch(`${BAG_PAND_URL}?${params.toString()}`);
 
     if (!response.ok) {
-      throw new Error(`Pand request failed with ${response.status}`);
+      throw new Error(`Pand search failed: ${response.status}`);
     }
 
     const data =
       (await response.json()) as FeatureCollectionResponse<PandFeature>;
 
-    return data.features?.[0];
-  };
+    const buildings = data.features ?? [];
 
-  // ---------------------------------------------------------------------------
-  // Address -> Pand
-  // ---------------------------------------------------------------------------
+    console.log("Nearby BAG buildings:", buildings);
 
-  const getPandFromAddress = async (location: LocationSearchFeature) => {
-    // STEP 1:
-    // Location API result UUID
-    // -> BAG address
+    /*
+     * Prefer the actual building containing
+     * the address point.
+     */
+    const containingBuilding = buildings.find((building) =>
+      pointInsidePolygon(lng, lat, building.geometry),
+    );
 
-    const address = await getBagAddress(location);
-
-    const addressObjectId =
-      address.properties?.adresseerbaar_object_identificatie;
-
-    const addressObjectType = address.properties?.adresseerbaar_object_type;
-
-    if (!addressObjectId) {
-      throw new Error(
-        "Selected BAG address contains no adresseerbaar_object_identificatie.",
-      );
+    if (containingBuilding) {
+      return containingBuilding;
     }
 
-    if (
-      addressObjectType &&
-      addressObjectType.toLowerCase() !== "verblijfsobject"
-    ) {
-      throw new Error(
-        `Selected address refers to ${addressObjectType}, not a verblijfsobject.`,
-      );
+    /*
+     * Fallback:
+     * return nearest candidate if the address point happens
+     * to sit just outside the polygon.
+     */
+    if (buildings.length > 0) {
+      let closest: PandFeature | undefined;
+
+      let closestDistance = Infinity;
+
+      for (const building of buildings) {
+        const layer = L.geoJSON(building as Feature);
+
+        const center = layer.getBounds().getCenter();
+
+        const distance = map.distance([lat, lng], center);
+
+        if (distance < closestDistance) {
+          closestDistance = distance;
+
+          closest = building;
+        }
+      }
+
+      return closest;
     }
 
-    // STEP 2:
-    // Addressable object
-    // -> Verblijfsobject
-
-    const verblijfsobject = await getVerblijfsobject(addressObjectId);
-
-    if (!verblijfsobject) {
-      throw new Error(`No verblijfsobject found for ${addressObjectId}.`);
-    }
-
-    // STEP 3:
-    // Verblijfsobject
-    // -> Pand relationship
-
-    const pandId = extractPandId(verblijfsobject.properties?.pand);
-
-    if (!pandId) {
-      console.error(
-        "Could not parse BAG pand relationship:",
-        verblijfsobject.properties?.pand,
-      );
-
-      throw new Error("No related pand could be found.");
-    }
-
-    // STEP 4:
-    // Pand ID
-    // -> Polygon
-
-    const pand = await getPand(pandId);
-
-    if (!pand) {
-      throw new Error(`Pand ${pandId} could not be found.`);
-    }
-
-    return {
-      pandId,
-
-      feature: pand,
-    };
+    return undefined;
   };
 
   // ---------------------------------------------------------------------------
@@ -655,58 +537,93 @@ const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
   const selectAddress = async (address: LocationSearchFeature) => {
     const label = address.properties.display_name;
 
-    skipNextSearch.current = true;
-
     setQuery(label);
-
     setOpen(false);
-
     setResults([]);
+
+    skipNextSearch.current = true;
 
     try {
       setLoading(true);
 
-      const { pandId, feature } = await getPandFromAddress(address);
+      const geometry = address.geometry;
 
-      // Reset previous building
+      if (!geometry || geometry.type !== "Point") {
+        throw new Error("Selected address has no point geometry.");
+      }
+
+      const [lng, lat] = geometry.coordinates;
+
+      console.log("Selected address:", label, lat, lng);
+
+      /*
+       * Immediately zoom to the address.
+       *
+       * Even if the BAG polygon lookup subsequently fails,
+       * the user still sees where the address is.
+       */
+      map.flyTo([lat, lng], 19, {
+        animate: true,
+        duration: 0.7,
+      });
+
+      /*
+       * Find BAG building at selected address.
+       */
+      const feature = await findPandAtLocation(lng, lat);
+
+      if (!feature) {
+        throw new Error(`No BAG building found near ${label}.`);
+      }
+
+      const pandId = feature.properties.identificatie;
+
+      console.log("Found BAG pand:", pandId, feature);
+
+      /*
+       * Reset previous VectorGrid highlight
+       */
       if (previousFeatureId.current) {
         vectorLayerRef.current?.resetFeatureStyle(previousFeatureId.current);
       }
 
       previousFeatureId.current = pandId;
 
-      // Highlight vector tile
+      /*
+       * Highlight VectorGrid polygon
+       */
       vectorLayerRef.current?.setFeatureStyle(pandId, {
         fill: true,
-
         fillColor: "#facc15",
-
         fillOpacity: 0.9,
-
         color: "#ef4444",
-
         weight: 3,
       });
 
-      // Remove previous GeoJSON highlight
+      /*
+       * Remove previous exact GeoJSON highlight
+       */
       if (highlightRef.current) {
         map.removeLayer(highlightRef.current);
       }
 
-      // Draw selected Pand geometry
+      /*
+       * Add selected polygon as separate
+       * GeoJSON layer.
+       *
+       * This guarantees that we see the highlight
+       * even if the VectorGrid tile hasn't loaded yet.
+       */
       const highlight = L.geoJSON(
         feature as Feature<GeoPolygon | MultiPolygon, BagProps>,
         {
           style: {
             color: "#ef4444",
-
             weight: 4,
 
             fill: true,
-
             fillColor: "#facc15",
-
-            fillOpacity: 0.35,
+            fillOpacity: 0.45,
           },
 
           interactive: false,
@@ -715,13 +632,21 @@ const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
 
       highlight.addTo(map);
 
+      /*
+       * Bring highlight above other Leaflet layers.
+       */
+      highlight.bringToFront();
+
       highlightRef.current = highlight;
 
+      /*
+       * Zoom precisely to the building.
+       */
       const bounds = highlight.getBounds();
 
       if (bounds.isValid()) {
         map.fitBounds(bounds, {
-          padding: [100, 100],
+          padding: [120, 120],
 
           maxZoom: 19,
 
@@ -731,7 +656,7 @@ const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
         });
       }
     } catch (error) {
-      console.error("Could not highlight selected address:", error);
+      console.error("Could not locate selected building:", error);
     } finally {
       setLoading(false);
     }
