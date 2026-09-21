@@ -178,6 +178,16 @@ const BagLayer = () => {
     (async () => {
       // leaflet.vectorgrid expects a global L, so set it before importing
       Object.assign(window, { L });
+
+      // Compatibility patch for leaflet.vectorgrid + Leaflet >= 1.8
+      const DomEvent = L.DomEvent as typeof L.DomEvent & {
+        fakeStop?: (e: Event) => boolean;
+      };
+
+      if (!DomEvent.fakeStop) {
+        DomEvent.fakeStop = () => true;
+      }
+
       await import("leaflet.vectorgrid");
       if (cancelled) return;
 
@@ -206,6 +216,7 @@ const BagLayer = () => {
           });
         }),
       );
+
       layer.on(
         "mouseout",
         handler((e) =>
