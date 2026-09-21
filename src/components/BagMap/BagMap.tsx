@@ -1,4 +1,5 @@
 "use client";
+
 import {
   GeoJSON,
   MapContainer,
@@ -6,6 +7,7 @@ import {
   TileLayer,
   useMap,
 } from "react-leaflet";
+
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
@@ -16,11 +18,14 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
+
 import { Input } from "@/components/ui/input";
 
-import { Search, Loader2 } from "lucide-react";
+import { Loader2, Search } from "lucide-react";
 
 import { useEffect, useRef, useState } from "react";
+
+import type { MutableRefObject } from "react";
 
 import type {
   Feature,
@@ -30,43 +35,54 @@ import type {
   MultiPolygon,
   Polygon as GeoPolygon,
 } from "geojson";
+
 import enschedeJson from "@/assets/shapefile/enschede/enschede.json";
+
+// -----------------------------------------------------------------------------
+// Enschede boundary
+// -----------------------------------------------------------------------------
 
 const raw = enschedeJson as unknown as GeoJsonObject;
 
-// Flatten any GeoJSON shape into a plain list of geometries
 const collectGeometries = (obj: GeoJsonObject): Geometry[] => {
   switch (obj.type) {
     case "FeatureCollection":
-      return (obj as FeatureCollection).features.flatMap((f) =>
-        f.geometry ? collectGeometries(f.geometry) : [],
+      return (obj as FeatureCollection).features.flatMap((feature) =>
+        feature.geometry ? collectGeometries(feature.geometry) : [],
       );
+
     case "Feature": {
-      const g = (obj as Feature).geometry;
-      return g ? collectGeometries(g) : [];
+      const geometry = (obj as Feature).geometry;
+
+      return geometry ? collectGeometries(geometry) : [];
     }
+
     case "GeometryCollection":
-      return (obj as unknown as { geometries: Geometry[] }).geometries.flatMap(
-        collectGeometries,
-      );
+      return (
+        obj as unknown as {
+          geometries: Geometry[];
+        }
+      ).geometries.flatMap(collectGeometries);
+
     default:
       return [obj as Geometry];
   }
 };
 
 const polygons = collectGeometries(raw).filter(
-  (g): g is GeoPolygon | MultiPolygon =>
-    g.type === "Polygon" || g.type === "MultiPolygon",
+  (geometry): geometry is GeoPolygon | MultiPolygon =>
+    geometry.type === "Polygon" || geometry.type === "MultiPolygon",
 );
 
 if (polygons.length === 0) {
   throw new Error(
-    `enschede.json has no Polygon/MultiPolygon geometry (top-level type: "${raw.type}").`,
+    `enschede.json has no Polygon/MultiPolygon geometry. Top-level type: "${raw.type}".`,
   );
 }
 
 const enschede: FeatureCollection<GeoPolygon | MultiPolygon> = {
   type: "FeatureCollection",
+
   features: polygons.map((geometry) => ({
     type: "Feature",
     properties: {},
@@ -74,24 +90,33 @@ const enschede: FeatureCollection<GeoPolygon | MultiPolygon> = {
   })),
 };
 
-// ---- Boundary geometry ---------------------------------------------------
-// Every ring (outer + holes) of every polygon, as [lat, lng]
+// -----------------------------------------------------------------------------
+// Boundary rings
+// -----------------------------------------------------------------------------
+
 const RINGS: L.LatLngTuple[][] = [];
-for (const f of enschede.features) {
-  const g = f.geometry;
-  const polys = g.type === "Polygon" ? [g.coordinates] : g.coordinates;
-  for (const poly of polys)
-    for (const ring of poly)
+
+for (const feature of enschede.features) {
+  const geometry = feature.geometry;
+
+  const polygonGroups =
+    geometry.type === "Polygon" ? [geometry.coordinates] : geometry.coordinates;
+
+  for (const polygon of polygonGroups) {
+    for (const ring of polygon) {
       RINGS.push(ring.map(([lng, lat]) => [lat, lng] as L.LatLngTuple));
+    }
+  }
 }
 
 const ENSCHEDE_BOUNDS = L.geoJSON(enschede).getBounds();
-const MAX_BOUNDS = ENSCHEDE_BOUNDS.pad(0.1);
-const TILE_BOUNDS = ENSCHEDE_BOUNDS.pad(0.02); // only fetch tiles around the city
 
-// "World minus Enschede": a big outer ring plus the boundary rings, filled
-// with the even-odd rule (Leaflet's default), so the city itself is a hole
+const MAX_BOUNDS = ENSCHEDE_BOUNDS.pad(0.1);
+
+const TILE_BOUNDS = ENSCHEDE_BOUNDS.pad(0.02);
+
 const outer = MAX_BOUNDS.pad(5);
+
 const MASK: L.LatLngTuple[][] = [
   [
     [outer.getSouth(), outer.getWest()],
@@ -99,16 +124,22 @@ const MASK: L.LatLngTuple[][] = [
     [outer.getNorth(), outer.getEast()],
     [outer.getSouth(), outer.getEast()],
   ],
+
   ...RINGS,
 ];
 
-// Even-odd point-in-polygon across all rings (handles holes/enclaves)
+// -----------------------------------------------------------------------------
+// Point-in-polygon check
+// -----------------------------------------------------------------------------
+
 const insideEnschede = (lat: number, lng: number) => {
   let inside = false;
+
   for (const ring of RINGS) {
     for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
       const [yi, xi] = ring[i];
       const [yj, xj] = ring[j];
+
       if (
         yi > lat !== yj > lat &&
         lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi
@@ -117,103 +148,295 @@ const insideEnschede = (lat: number, lng: number) => {
       }
     }
   }
+
   return inside;
 };
 
 const CENTER: [number, number] = [52.2215, 6.8937];
 
-// {y}/{x} = tileRow/tileCol in OGC API Tiles
-const BAG_URL =
+// -----------------------------------------------------------------------------
+// PDOK endpoints
+// -----------------------------------------------------------------------------
+
+const BAG_TILE_URL =
   "https://api.pdok.nl/kadaster/bag/ogc/v2/tiles/WebMercatorQuad/{z}/{y}/{x}?f=mvt";
 
-const BAG_FEATURES_URL =
+const LOCATION_SEARCH_URL =
+  "https://api.pdok.nl/kadaster/location-api/v1/search";
+
+const BAG_ADRES_URL =
+  "https://api.pdok.nl/kadaster/bag/ogc/v2/collections/adres/items";
+
+const BAG_VERBLIJFSOBJECT_URL =
+  "https://api.pdok.nl/kadaster/bag/ogc/v2/collections/verblijfsobject/items";
+
+const BAG_PAND_URL =
   "https://api.pdok.nl/kadaster/bag/ogc/v2/collections/pand/items";
 
-// ---- BAG layer -----------------------------------------------------------
+// -----------------------------------------------------------------------------
+// BAG Types
+// -----------------------------------------------------------------------------
+
 interface BagProps {
   identificatie: string;
+
   bouwjaar?: number;
+
   status?: string;
+
   gebruiksdoel?: string;
+
   aantal_verblijfsobjecten?: number;
 }
 
-type VgEvent = L.LeafletMouseEvent & { layer: { properties: BagProps } };
+interface BagAddressProps {
+  identificatie?: string;
 
-interface VectorGridLayer extends L.GridLayer {
-  setFeatureStyle(id: string, style: L.PathOptions): void;
-  resetFeatureStyle(id: string): void;
+  adresseerbaar_object_identificatie?: string;
+
+  adresseerbaar_object_type?: string;
 }
 
-interface BagSearchFeature {
+interface BagAddressFeature {
   type: "Feature";
+
+  id: string;
+
+  properties: BagAddressProps;
+
+  geometry?: Geometry;
+}
+
+interface VerblijfsobjectProps {
+  identificatie?: string;
+
+  pand?: unknown;
+}
+
+interface VerblijfsobjectFeature {
+  type: "Feature";
+
   id?: string;
+
+  properties: VerblijfsobjectProps;
+
+  geometry?: Geometry;
+}
+
+interface PandFeature {
+  type: "Feature";
+
+  id?: string;
+
   properties: BagProps;
+
   geometry: GeoPolygon | MultiPolygon;
 }
 
-interface BagSearchResponse {
+interface FeatureCollectionResponse<T> {
   type: "FeatureCollection";
-  features: BagSearchFeature[];
+
+  features: T[];
 }
 
-// leaflet.vectorgrid attaches itself to L at runtime but ships no types
-const LL = L as unknown as {
-  vectorGrid: { protobuf(url: string, options: object): VectorGridLayer };
-  canvas: { tile: unknown };
+// -----------------------------------------------------------------------------
+// Location API result
+// -----------------------------------------------------------------------------
+
+interface LocationSearchFeature {
+  type: "Feature";
+
+  id: string;
+
+  geometry?: {
+    type: "Point";
+
+    coordinates: [number, number];
+  };
+
+  properties: {
+    display_name: string;
+
+    collection_id?: string;
+
+    collection_version?: number;
+
+    score?: number;
+  };
+}
+
+interface LocationSearchResponse {
+  type: "FeatureCollection";
+
+  features: LocationSearchFeature[];
+}
+
+// -----------------------------------------------------------------------------
+// VectorGrid types
+// -----------------------------------------------------------------------------
+
+type VgEvent = L.LeafletMouseEvent & {
+  layer: {
+    properties: BagProps;
+  };
 };
 
-// Lets us write handlers with a typed event instead of `any`
-const handler = (fn: (e: VgEvent) => void) =>
+interface VectorGridLayer extends L.GridLayer {
+  setFeatureStyle(id: string, style: L.PathOptions): void;
+
+  resetFeatureStyle(id: string): void;
+}
+
+const LL = L as unknown as {
+  vectorGrid: {
+    protobuf(url: string, options: object): VectorGridLayer;
+  };
+
+  canvas: {
+    tile: unknown;
+  };
+};
+
+const handler = (fn: (event: VgEvent) => void) =>
   fn as unknown as L.LeafletEventHandlerFn;
 
-const colorByYear = (y?: number) =>
-  !y
+// -----------------------------------------------------------------------------
+// Building styles
+// -----------------------------------------------------------------------------
+
+const colorByYear = (year?: number) =>
+  !year
     ? "#9ca3af"
-    : y < 1900
+    : year < 1900
       ? "#7f1d1d"
-      : y < 1945
+      : year < 1945
         ? "#c2410c"
-        : y < 1975
+        : year < 1975
           ? "#d97706"
-          : y < 2000
+          : year < 2000
             ? "#65a30d"
             : "#0284c7";
 
-const pandStyle = (p: BagProps) => ({
+const pandStyle = (properties: BagProps) => ({
   fill: true,
-  fillColor: colorByYear(p.bouwjaar),
+
+  fillColor: colorByYear(properties.bouwjaar),
+
   fillOpacity: 0.6,
+
   color: "#1f2937",
+
   weight: 0.6,
 });
 
-// Draw only `pand`; any other layer in the tile gets an empty style, so it's skipped
-const layerStyles = new Proxy({ pand: pandStyle } as Record<string, unknown>, {
-  get: (target, name) =>
-    typeof name === "string" && name in target ? target[name] : [],
-});
+const layerStyles = new Proxy(
+  {
+    pand: pandStyle,
+  } as Record<string, unknown>,
+
+  {
+    get: (target, name) =>
+      typeof name === "string" && name in target ? target[name] : [],
+  },
+);
+
+// -----------------------------------------------------------------------------
+// Helper: extract Pand ID from BAG relation
+// -----------------------------------------------------------------------------
+
+const extractPandId = (relation: unknown): string | undefined => {
+  if (!relation) {
+    return undefined;
+  }
+
+  // Example:
+  // ["0153100000123456"]
+
+  if (Array.isArray(relation)) {
+    for (const item of relation) {
+      const id = extractPandId(item);
+
+      if (id) {
+        return id;
+      }
+    }
+
+    return undefined;
+  }
+
+  if (typeof relation === "string") {
+    // Plain BAG ID
+    if (/^\d{16}$/.test(relation)) {
+      return relation;
+    }
+
+    // Possibly URL ending in BAG ID
+    const match = relation.match(/(\d{16})(?:\/)?$/);
+
+    return match?.[1];
+  }
+
+  if (typeof relation === "object") {
+    const object = relation as Record<string, unknown>;
+
+    const candidates = [
+      object.identificatie,
+      object.id,
+      object.value,
+      object.href,
+    ];
+
+    for (const candidate of candidates) {
+      const id = extractPandId(candidate);
+
+      if (id) {
+        return id;
+      }
+    }
+  }
+
+  return undefined;
+};
+
+// -----------------------------------------------------------------------------
+// Search component
+// -----------------------------------------------------------------------------
 
 interface BagSearchProps {
-  vectorLayerRef: React.MutableRefObject<VectorGridLayer | null>;
+  vectorLayerRef: MutableRefObject<VectorGridLayer | null>;
 }
 
 const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
   const map = useMap();
 
   const [query, setQuery] = useState("");
-  const [results, setResults] = useState<BagSearchFeature[]>([]);
+
+  const [results, setResults] = useState<LocationSearchFeature[]>([]);
+
   const [loading, setLoading] = useState(false);
+
   const [open, setOpen] = useState(false);
 
   const highlightRef = useRef<L.GeoJSON | null>(null);
+
   const previousFeatureId = useRef<string | null>(null);
 
+  const skipNextSearch = useRef(false);
+
+  // ---------------------------------------------------------------------------
+  // Search addresses
+  // ---------------------------------------------------------------------------
+
   useEffect(() => {
-    if (query.trim().length < 2) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setResults([]);
-      setOpen(false);
+    if (skipNextSearch.current) {
+      skipNextSearch.current = false;
+
+      return;
+    }
+
+    const value = query.trim();
+
+    if (value.length < 2) {
       return;
     }
 
@@ -223,131 +446,361 @@ const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
       try {
         setLoading(true);
 
-        const bounds = ENSCHEDE_BOUNDS;
+        const params = new URLSearchParams();
 
-        const bbox = [
-          bounds.getWest(),
-          bounds.getSouth(),
-          bounds.getEast(),
-          bounds.getNorth(),
-        ].join(",");
+        params.set("q", `${value} Enschede`);
 
-        /*
-         * Search BAG identification.
-         *
-         * Example:
-         *     015310...
-         */
-        const filter = `identificatie LIKE '${query.trim().replace(/'/g, "''")}%'`;
+        // IMPORTANT:
+        // restrict Location API
+        // specifically to addresses.
+        params.set("adres[version]", "1");
 
-        const params = new URLSearchParams({
-          f: "json",
-          limit: "10",
-          bbox,
-          filter,
-        });
+        params.set("limit", "10");
+
+        params.set("f", "json");
 
         const response = await fetch(
-          `${BAG_FEATURES_URL}?${params.toString()}`,
+          `${LOCATION_SEARCH_URL}?${params.toString()}`,
           {
             signal: controller.signal,
           },
         );
 
         if (!response.ok) {
-          throw new Error(`BAG search failed: ${response.status}`);
+          throw new Error(`Location API failed with ${response.status}`);
         }
 
-        const data = (await response.json()) as BagSearchResponse;
+        const data = (await response.json()) as LocationSearchResponse;
 
-        setResults(data.features ?? []);
+        const filtered = (data.features ?? [])
+          .filter((feature) => {
+            const name = feature.properties.display_name?.toLowerCase();
+
+            return name && name.includes("enschede");
+          })
+          .slice(0, 10);
+
+        setResults(filtered);
+
         setOpen(true);
       } catch (error) {
         if ((error as Error).name !== "AbortError") {
-          console.error("BAG search error:", error);
+          console.error("PDOK address search failed:", error);
+
           setResults([]);
         }
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
       }
     }, 300);
 
     return () => {
       controller.abort();
+
       window.clearTimeout(timeout);
     };
   }, [query]);
 
-  const selectFeature = (feature: BagSearchFeature) => {
-    const id = feature.properties.identificatie;
+  // ---------------------------------------------------------------------------
+  // Get BAG Address
+  // ---------------------------------------------------------------------------
 
-    setQuery(id);
-    setResults([]);
+  const getBagAddress = async (feature: LocationSearchFeature) => {
+    if (!feature.id) {
+      throw new Error("Location API result has no feature ID.");
+    }
+
+    const response = await fetch(
+      `${BAG_ADRES_URL}/${encodeURIComponent(feature.id)}?f=json`,
+    );
+
+    if (!response.ok) {
+      throw new Error(`BAG address request failed with ${response.status}`);
+    }
+
+    return (await response.json()) as BagAddressFeature;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Get Verblijfsobject
+  // ---------------------------------------------------------------------------
+
+  const getVerblijfsobject = async (identificatie: string) => {
+    const params = new URLSearchParams({
+      f: "json",
+
+      identificatie,
+
+      limit: "1",
+    });
+
+    const response = await fetch(
+      `${BAG_VERBLIJFSOBJECT_URL}?${params.toString()}`,
+    );
+
+    if (!response.ok) {
+      throw new Error(`Verblijfsobject request failed with ${response.status}`);
+    }
+
+    const data =
+      (await response.json()) as FeatureCollectionResponse<VerblijfsobjectFeature>;
+
+    return data.features?.[0];
+  };
+
+  // ---------------------------------------------------------------------------
+  // Get Pand
+  // ---------------------------------------------------------------------------
+
+  const getPand = async (pandId: string) => {
+    const params = new URLSearchParams({
+      f: "json",
+
+      identificatie: pandId,
+
+      limit: "1",
+    });
+
+    const response = await fetch(`${BAG_PAND_URL}?${params.toString()}`);
+
+    if (!response.ok) {
+      throw new Error(`Pand request failed with ${response.status}`);
+    }
+
+    const data =
+      (await response.json()) as FeatureCollectionResponse<PandFeature>;
+
+    return data.features?.[0];
+  };
+
+  // ---------------------------------------------------------------------------
+  // Address -> Pand
+  // ---------------------------------------------------------------------------
+
+  const getPandFromAddress = async (location: LocationSearchFeature) => {
+    // STEP 1:
+    // Location API result UUID
+    // -> BAG address
+
+    const address = await getBagAddress(location);
+
+    const addressObjectId =
+      address.properties?.adresseerbaar_object_identificatie;
+
+    const addressObjectType = address.properties?.adresseerbaar_object_type;
+
+    if (!addressObjectId) {
+      throw new Error(
+        "Selected BAG address contains no adresseerbaar_object_identificatie.",
+      );
+    }
+
+    if (
+      addressObjectType &&
+      addressObjectType.toLowerCase() !== "verblijfsobject"
+    ) {
+      throw new Error(
+        `Selected address refers to ${addressObjectType}, not a verblijfsobject.`,
+      );
+    }
+
+    // STEP 2:
+    // Addressable object
+    // -> Verblijfsobject
+
+    const verblijfsobject = await getVerblijfsobject(addressObjectId);
+
+    if (!verblijfsobject) {
+      throw new Error(`No verblijfsobject found for ${addressObjectId}.`);
+    }
+
+    // STEP 3:
+    // Verblijfsobject
+    // -> Pand relationship
+
+    const pandId = extractPandId(verblijfsobject.properties?.pand);
+
+    if (!pandId) {
+      console.error(
+        "Could not parse BAG pand relationship:",
+        verblijfsobject.properties?.pand,
+      );
+
+      throw new Error("No related pand could be found.");
+    }
+
+    // STEP 4:
+    // Pand ID
+    // -> Polygon
+
+    const pand = await getPand(pandId);
+
+    if (!pand) {
+      throw new Error(`Pand ${pandId} could not be found.`);
+    }
+
+    return {
+      pandId,
+
+      feature: pand,
+    };
+  };
+
+  // ---------------------------------------------------------------------------
+  // Select result
+  // ---------------------------------------------------------------------------
+
+  const selectAddress = async (address: LocationSearchFeature) => {
+    const label = address.properties.display_name;
+
+    skipNextSearch.current = true;
+
+    setQuery(label);
+
     setOpen(false);
 
-    // Reset previous vector-grid highlight
-    if (previousFeatureId.current) {
-      vectorLayerRef.current?.resetFeatureStyle(previousFeatureId.current);
-    }
+    setResults([]);
 
-    previousFeatureId.current = id;
+    try {
+      setLoading(true);
 
-    // Highlight VectorGrid feature
-    vectorLayerRef.current?.setFeatureStyle(id, {
-      fill: true,
-      fillColor: "#facc15",
-      fillOpacity: 0.9,
-      color: "#ef4444",
-      weight: 3,
-    });
+      const { pandId, feature } = await getPandFromAddress(address);
 
-    // Remove previous GeoJSON highlight
-    if (highlightRef.current) {
-      map.removeLayer(highlightRef.current);
-    }
+      // Reset previous building
+      if (previousFeatureId.current) {
+        vectorLayerRef.current?.resetFeatureStyle(previousFeatureId.current);
+      }
 
-    // Create exact highlight using returned geometry
-    const highlight = L.geoJSON(feature as Feature, {
-      style: {
-        color: "#ef4444",
-        weight: 4,
+      previousFeatureId.current = pandId;
+
+      // Highlight vector tile
+      vectorLayerRef.current?.setFeatureStyle(pandId, {
+        fill: true,
+
         fillColor: "#facc15",
-        fillOpacity: 0.35,
-      },
-      interactive: false,
-    });
 
-    highlight.addTo(map);
+        fillOpacity: 0.9,
 
-    highlightRef.current = highlight;
+        color: "#ef4444",
 
-    const bounds = highlight.getBounds();
-
-    if (bounds.isValid()) {
-      map.fitBounds(bounds, {
-        padding: [80, 80],
-        maxZoom: 19,
+        weight: 3,
       });
+
+      // Remove previous GeoJSON highlight
+      if (highlightRef.current) {
+        map.removeLayer(highlightRef.current);
+      }
+
+      // Draw selected Pand geometry
+      const highlight = L.geoJSON(
+        feature as Feature<GeoPolygon | MultiPolygon, BagProps>,
+        {
+          style: {
+            color: "#ef4444",
+
+            weight: 4,
+
+            fill: true,
+
+            fillColor: "#facc15",
+
+            fillOpacity: 0.35,
+          },
+
+          interactive: false,
+        },
+      );
+
+      highlight.addTo(map);
+
+      highlightRef.current = highlight;
+
+      const bounds = highlight.getBounds();
+
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, {
+          padding: [100, 100],
+
+          maxZoom: 19,
+
+          animate: true,
+
+          duration: 0.7,
+        });
+      }
+    } catch (error) {
+      console.error("Could not highlight selected address:", error);
+    } finally {
+      setLoading(false);
     }
   };
 
+  // ---------------------------------------------------------------------------
+  // Cleanup highlight
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    return () => {
+      if (highlightRef.current) {
+        map.removeLayer(highlightRef.current);
+      }
+    };
+  }, [map]);
+
+  // ---------------------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------------------
+
   return (
     <div
-      className="absolute left-1/2 top-4 z-[1000] w-[420px] -translate-x-1/2"
-      onMouseDown={(e) => e.stopPropagation()}
-      onClick={(e) => e.stopPropagation()}
+      className="
+        absolute
+        left-1/2
+        top-4
+        z-[1000]
+        w-[min(430px,calc(100%-32px))]
+        -translate-x-1/2
+      "
+      onMouseDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+      onWheel={(event) => event.stopPropagation()}
     >
       <Command
         shouldFilter={false}
-        className="overflow-visible rounded-xl border bg-background shadow-lg"
+        className="
+          overflow-visible
+          rounded-xl
+          border
+          bg-background
+          shadow-lg
+        "
       >
-        <div className="relative flex items-center">
-          <Search className="absolute left-3 h-4 w-4 text-muted-foreground" />
+        <div
+          className="
+            relative
+            flex
+            items-center
+          "
+        >
+          <Search
+            className="
+              pointer-events-none
+              absolute
+              left-3
+              h-4
+              w-4
+              text-muted-foreground
+            "
+          />
 
           <Input
             value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
+            onChange={(event) => {
+              setQuery(event.target.value);
+
               setOpen(true);
             }}
             onFocus={() => {
@@ -355,45 +808,91 @@ const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
                 setOpen(true);
               }
             }}
-            placeholder="Search BAG polygon ID..."
-            className="h-11 border-0 pl-9 pr-10 shadow-none focus-visible:ring-0"
+            placeholder="Search address in Enschede..."
+            autoComplete="off"
+            className="
+              h-12
+              border-0
+              pl-10
+              pr-10
+              shadow-none
+              focus-visible:ring-0
+            "
           />
 
           {loading && (
-            <Loader2 className="absolute right-3 h-4 w-4 animate-spin text-muted-foreground" />
+            <Loader2
+              className="
+                pointer-events-none
+                absolute
+                right-3
+                h-4
+                w-4
+                animate-spin
+                text-muted-foreground
+              "
+            />
           )}
         </div>
 
-        {open && query.length >= 2 && (
-          <CommandList className="absolute top-[calc(100%+6px)] z-[1100] w-full rounded-xl border bg-background shadow-xl">
+        {open && query.trim().length >= 2 && (
+          <CommandList
+            className="
+                absolute
+                top-[calc(100%+8px)]
+                z-[1100]
+                max-h-[320px]
+                w-full
+                rounded-xl
+                border
+                bg-background
+                p-1
+                shadow-xl
+              "
+          >
             {!loading && results.length === 0 && (
-              <CommandEmpty>No buildings found.</CommandEmpty>
+              <CommandEmpty>No addresses found in Enschede.</CommandEmpty>
             )}
 
-            <CommandGroup heading="Buildings">
-              {results.map((feature) => {
-                const p = feature.properties;
-
-                return (
-                  <CommandItem
-                    key={feature.id ?? p.identificatie}
-                    value={p.identificatie}
-                    onSelect={() => selectFeature(feature)}
-                    className="cursor-pointer"
+            <CommandGroup heading="Addresses">
+              {results.map((feature) => (
+                <CommandItem
+                  key={feature.id}
+                  value={feature.properties.display_name}
+                  onSelect={() => selectAddress(feature)}
+                  className="
+                        cursor-pointer
+                        rounded-lg
+                        px-3
+                        py-3
+                      "
+                >
+                  <div
+                    className="
+                          flex
+                          flex-col
+                          gap-0.5
+                        "
                   >
-                    <div className="flex flex-col">
-                      <span className="font-medium">
-                        Pand {p.identificatie}
-                      </span>
+                    <span
+                      className="
+                            font-medium
+                          "
+                    >
+                      {feature.properties.display_name}
+                    </span>
 
-                      <span className="text-xs text-muted-foreground">
-                        Built {p.bouwjaar ?? "unknown"}
-                        {p.gebruiksdoel ? ` · ${p.gebruiksdoel}` : ""}
-                      </span>
-                    </div>
-                  </CommandItem>
-                );
-              })}
+                    <span
+                      className="
+                            text-xs
+                            text-muted-foreground
+                          "
+                    >
+                      BAG address
+                    </span>
+                  </div>
+                </CommandItem>
+              ))}
             </CommandGroup>
           </CommandList>
         )}
@@ -402,8 +901,12 @@ const BagSearch = ({ vectorLayerRef }: BagSearchProps) => {
   );
 };
 
+// -----------------------------------------------------------------------------
+// BAG vector layer
+// -----------------------------------------------------------------------------
+
 interface BagLayerProps {
-  layerRef: React.MutableRefObject<VectorGridLayer | null>;
+  layerRef: MutableRefObject<VectorGridLayer | null>;
 }
 
 const BagLayer = ({ layerRef }: BagLayerProps) => {
@@ -411,34 +914,49 @@ const BagLayer = ({ layerRef }: BagLayerProps) => {
 
   useEffect(() => {
     let layer: VectorGridLayer | undefined;
+
     let cancelled = false;
 
     (async () => {
-      // leaflet.vectorgrid expects a global L, so set it before importing
-      Object.assign(window, { L });
+      Object.assign(window, {
+        L,
+      });
 
-      // Compatibility patch for leaflet.vectorgrid + Leaflet >= 1.8
+      // Compatibility patch:
+      // leaflet.vectorgrid + modern Leaflet
       const DomEvent = L.DomEvent as typeof L.DomEvent & {
-        fakeStop?: (e: Event) => boolean;
+        fakeStop?: (event: Event) => boolean;
+
+        _fakeStop?: (event: Event) => boolean;
       };
 
       if (!DomEvent.fakeStop) {
         DomEvent.fakeStop = () => true;
       }
 
-      await import("leaflet.vectorgrid");
-      if (cancelled) return;
+      if (!DomEvent._fakeStop) {
+        DomEvent._fakeStop = () => true;
+      }
 
-      layer = LL.vectorGrid.protobuf(BAG_URL, {
+      await import("leaflet.vectorgrid");
+
+      if (cancelled) {
+        return;
+      }
+
+      layer = LL.vectorGrid.protobuf(BAG_TILE_URL, {
         rendererFactory: LL.canvas.tile,
+
         interactive: true,
+
         bounds: TILE_BOUNDS,
 
         minNativeZoom: 17,
+
         maxNativeZoom: 17,
 
-        getFeatureId: (f: { properties: BagProps }) =>
-          f.properties.identificatie,
+        getFeatureId: (feature: { properties: BagProps }) =>
+          feature.properties.identificatie,
 
         vectorTileLayerStyles: layerStyles,
       });
@@ -447,41 +965,67 @@ const BagLayer = ({ layerRef }: BagLayerProps) => {
 
       layer.on(
         "mouseover",
-        handler((e) => {
-          if (!insideEnschede(e.latlng.lat, e.latlng.lng)) return;
-          layer?.setFeatureStyle(e.layer.properties.identificatie, {
-            fill: true,
-            fillColor: "#facc15",
-            fillOpacity: 0.9,
-            color: "#111",
-            weight: 1.5,
-          });
+
+        handler((event) => {
+          if (!insideEnschede(event.latlng.lat, event.latlng.lng)) {
+            return;
+          }
+
+          layer?.setFeatureStyle(
+            event.layer.properties.identificatie,
+
+            {
+              fill: true,
+
+              fillColor: "#facc15",
+
+              fillOpacity: 0.9,
+
+              color: "#111",
+
+              weight: 1.5,
+            },
+          );
         }),
       );
 
       layer.on(
         "mouseout",
-        handler((e) =>
-          layer?.resetFeatureStyle(e.layer.properties.identificatie),
-        ),
+
+        handler((event) => {
+          layer?.resetFeatureStyle(event.layer.properties.identificatie);
+        }),
       );
+
       layer.on(
         "click",
-        handler((e) => {
-          if (!insideEnschede(e.latlng.lat, e.latlng.lng)) return;
-          const p = e.layer.properties;
+
+        handler((event) => {
+          if (!insideEnschede(event.latlng.lat, event.latlng.lng)) {
+            return;
+          }
+
+          const properties = event.layer.properties;
+
           L.popup()
-            .setLatLng(e.latlng)
+            .setLatLng(event.latlng)
             .setContent(
-              `<b>Pand ${p.identificatie}</b><br/>
-               Built: ${p.bouwjaar ?? "n/a"}<br/>
-               Status: ${p.status ?? "n/a"}<br/>
-               Use: ${p.gebruiksdoel ?? "n/a"}<br/>
-               Units: ${p.aantal_verblijfsobjecten ?? "n/a"}`,
+              `
+                  <b>Pand ${properties.identificatie}</b>
+                  <br />
+                  Built: ${properties.bouwjaar ?? "n/a"}
+                  <br />
+                  Status: ${properties.status ?? "n/a"}
+                  <br />
+                  Use: ${properties.gebruiksdoel ?? "n/a"}
+                  <br />
+                  Units: ${properties.aantal_verblijfsobjecten ?? "n/a"}
+                `,
             )
             .openOn(map);
         }),
       );
+
       layer.addTo(map);
     })();
 
@@ -494,10 +1038,14 @@ const BagLayer = ({ layerRef }: BagLayerProps) => {
 
       layerRef.current = null;
     };
-  }, [map]);
+  }, [map, layerRef]);
 
   return null;
 };
+
+// -----------------------------------------------------------------------------
+// Main map
+// -----------------------------------------------------------------------------
 
 function BagMap() {
   const vectorLayerRef = useRef<VectorGridLayer | null>(null);
@@ -511,7 +1059,9 @@ function BagMap() {
       maxBounds={MAX_BOUNDS}
       style={{
         height: "100vh",
+
         width: "100%",
+
         position: "relative",
       }}
     >
@@ -528,7 +1078,9 @@ function BagMap() {
         interactive={false}
         pathOptions={{
           stroke: false,
+
           fillColor: "#f3f4f6",
+
           fillOpacity: 1,
         }}
       />
@@ -538,8 +1090,11 @@ function BagMap() {
         interactive={false}
         style={{
           color: "#374151",
+
           weight: 5,
+
           fillColor: "#808080",
+
           fillOpacity: 0.05,
         }}
       />
