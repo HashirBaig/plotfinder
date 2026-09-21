@@ -43,7 +43,7 @@ function ContactCard() {
     <div
       className="
         fixed
-        z-100
+        z-1200
         bottom-6
         right-6
         flex
