@@ -8,7 +8,7 @@ import { useMap } from "react-leaflet";
 
 import L from "leaflet";
 
-import { Loader2, Search } from "lucide-react";
+import { Loader2, Search, X } from "lucide-react";
 
 import {
   Command,
@@ -201,7 +201,7 @@ export default function BagSearch({ vectorLayerRef }: BagSearchProps) {
         absolute
         left-1/2
         top-4
-        z-[1000]
+        z-1000
         w-[min(430px,calc(100%-32px))]
         -translate-x-1/2
       "
@@ -222,52 +222,100 @@ export default function BagSearch({ vectorLayerRef }: BagSearchProps) {
       >
         <div
           className="
-            relative
-            flex
-            items-center
-          "
+    relative
+    flex
+    items-center
+  "
         >
           <Search
             className="
-              pointer-events-none
-              absolute
-              left-3
-              h-4
-              w-4
-              text-muted-foreground
-            "
+      pointer-events-none
+      absolute
+      left-3
+      h-4
+      w-4
+      text-muted-foreground
+    "
           />
 
           <Input
             value={query}
             onChange={(event) => {
               setQuery(event.target.value);
-
               setOpen(true);
             }}
             placeholder="Search address in Enschede..."
             autoComplete="off"
             className="
-              h-12
-              border-0
-              pl-10
-              pr-10
-              shadow-none
-              focus-visible:ring-0
-            "
+      h-12
+      border-0
+      pl-10
+      pr-16
+      shadow-none
+      focus-visible:ring-0
+    "
           />
 
           {loading && (
             <Loader2
               className="
-                absolute
-                right-3
-                h-4
-                w-4
-                animate-spin
-                text-muted-foreground
-              "
+        pointer-events-none
+        absolute
+        right-10
+        h-4
+        w-4
+        animate-spin
+        text-muted-foreground
+      "
             />
+          )}
+
+          {query && (
+            <button
+              type="button"
+              onClick={() => {
+                setQuery("");
+                setResults([]);
+                setOpen(false);
+              }}
+              className="
+        absolute
+        right-3
+        flex
+        h-7
+        w-7
+        items-center
+        justify-center
+        rounded-md
+        text-muted-foreground
+        transition-colors
+        hover:bg-muted
+        hover:text-foreground
+      "
+              aria-label="Clear search"
+            >
+              <X
+                className="h-4 w-4"
+                onClick={() => {
+                  setQuery("");
+                  setResults([]);
+                  setOpen(false);
+
+                  if (previousFeatureId.current) {
+                    vectorLayerRef.current?.resetFeatureStyle(
+                      previousFeatureId.current,
+                    );
+
+                    previousFeatureId.current = null;
+                  }
+
+                  if (highlightRef.current) {
+                    map.removeLayer(highlightRef.current);
+                    highlightRef.current = null;
+                  }
+                }}
+              />
+            </button>
           )}
         </div>
 
@@ -276,8 +324,8 @@ export default function BagSearch({ vectorLayerRef }: BagSearchProps) {
             className="
               absolute
               top-[calc(100%+8px)]
-              z-[1100]
-              max-h-[320px]
+              z-1100
+              max-h-80
               w-full
               rounded-xl
               border
